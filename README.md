@@ -6,6 +6,7 @@ Audio files are not publically available at the moment.
 
 ### Project structure
 
+```
 ├── README.md
 ├── archived -> old scripts & files
 ├── data
@@ -16,6 +17,7 @@ Audio files are not publically available at the moment.
 │   ├── load_data.py
 │   ├── task_utils.py
 │   └── train_test.py
+```
 
 ### Requirements
-TBA
+See requirements.txt - This will be continously updated 
