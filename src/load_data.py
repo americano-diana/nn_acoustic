@@ -65,13 +65,15 @@ def load_data(base_dir, batch_size, target_sr=16000):
             d["sample_rate"] = target_sr
         print(f"{i+1:03d}: {d['filename']} → {target_sr}Hz | Shape: {tuple(d['waveform'].shape)}")
 
-    # Build torch dataset list
-    data_list = []
-    for d in data:
-        label = torch.tensor([d["valence"], d["arousal"]], dtype=torch.float32)
-        data_list.append((d["waveform"], label))
+    # Build dictionary for easy access
+    data_dict = {
+        "waveforms": [d["waveform"] for d in data],
+        "valences": [float(d["valence"]) for d in data],
+        "arousals": [float(d["arousal"]) for d in data],
+        "filenames": [d["filename"] for d in data]
+    }
 
-    print("\n Data ready as a Torch object")
-    print(f"Total samples: {len(data_list)}\n")
+    print("\nData ready as a Torch object")
+    print(f"Total samples: {len(data_dict['waveforms'])}\n")
 
-    return data_list
+    return data_dict

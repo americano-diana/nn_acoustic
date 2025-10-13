@@ -40,23 +40,24 @@ def collate_fn(batch):
     return waveforms_padded, labels_tensor
 
 
-def create_data_splits(
+def split_data(
     waveforms,
-    valences,
-    arousals,
+    targets,
+    target_name,
     batch_size=8,
-    test_size=0.3,
+    test_size=0.2,
     random_state=42,
     collate_fn=None,
     dataset_class=None
 ):
     """
-    Split data into training, validation, and test sets for valence and arousal regression task
- 
+    Split data into training, validation, and test sets for a single regression target
+    (either valence or arousal).
+
     Args:
         waveforms (list of Tensors): list of waveform tensors
-        valences (list of floats): valence labels
-        arousals (list of floats): arousal labels
+        targets (list of floats): target values (valence or arousal)
+        target_name (str): name of the target ("valence" or "arousal"), used for print messages
         batch_size (int): batch size for DataLoader
         test_size (float): proportion of data for val+test combined (default = 0.3 → 70/15/15)
         random_state (int): random seed for reproducibility
@@ -64,88 +65,58 @@ def create_data_splits(
         dataset_class (torch Dataset class): dataset class to use (required)
 
     Returns:
-        dict: containing DataLoaders for valence and arousal
+        dict: containing DataLoaders for the selected target:
             {
-                'valence': {
-                    'train': DataLoader,
-                    'val': DataLoader,
-                    'test': DataLoader
-                },
-                'arousal': {
-                    'train': DataLoader,
-                    'val': DataLoader,
-                    'test': DataLoader
-                }
+                'train': DataLoader,
+                'val': DataLoader,
+                'test': DataLoader
             }
     """
-
     assert collate_fn is not None, "collate_fn must be provided."
     assert dataset_class is not None, "dataset_class must be provided."
 
     # === 1. Split indices ===
     train_indices, temp_indices = train_test_split(
         range(len(waveforms)),
-        test_size=test_size,  # 30% for val + test
+        test_size=test_size,
         random_state=random_state
     )
 
     val_indices, test_indices = train_test_split(
         temp_indices,
-        test_size=0.5,  # split 30% evenly: 15% val / 15% test
+        test_size=0.5,
         random_state=random_state
     )
 
-    print(f"Training samples: {len(train_indices)}")
-    print(f"Validation samples: {len(val_indices)}")
-    print(f"Test samples: {len(test_indices)}")
+    print(f"🔹 {target_name.upper()} Data Split:")
+    print(f"  Training samples:   {len(train_indices)}")
+    print(f"  Validation samples: {len(val_indices)}")
+    print(f"  Test samples:       {len(test_indices)}")
 
-    # === 2. Build subsets ===
-    def subset_data(indices, data_list):
-        return [data_list[i] for i in indices]
+    # === 2. Helper for subset selection ===
+    def subset(indices, data):
+        return [data[i] for i in indices]
 
-    # Training
-    train_waveforms = subset_data(train_indices, waveforms)
-    train_valences = subset_data(train_indices, valences)
-    train_arousals = subset_data(train_indices, arousals)
+    # === 3. Create subsets ===
+    train_waveforms = subset(train_indices, waveforms)
+    val_waveforms = subset(val_indices, waveforms)
+    test_waveforms = subset(test_indices, waveforms)
 
-    # Validation
-    val_waveforms = subset_data(val_indices, waveforms)
-    val_valences = subset_data(val_indices, valences)
-    val_arousals = subset_data(val_indices, arousals)
+    train_targets = subset(train_indices, targets)
+    val_targets = subset(val_indices, targets)
+    test_targets = subset(test_indices, targets)
 
-    # Test
-    test_waveforms = subset_data(test_indices, waveforms)
-    test_valences = subset_data(test_indices, valences)
-    test_arousals = subset_data(test_indices, arousals)
+    # === 4. Build datasets ===
+    train_dataset = dataset_class(train_waveforms, train_targets)
+    val_dataset = dataset_class(val_waveforms, val_targets)
+    test_dataset = dataset_class(test_waveforms, test_targets)
 
-    # === 3. Build datasets ===
-    valence_train_dataset = dataset_class(train_waveforms, train_valences)
-    valence_val_dataset = dataset_class(val_waveforms, val_valences)
-    valence_test_dataset = dataset_class(test_waveforms, test_valences)
-
-    arousal_train_dataset = dataset_class(train_waveforms, train_arousals)
-    arousal_val_dataset = dataset_class(val_waveforms, val_arousals)
-    arousal_test_dataset = dataset_class(test_waveforms, test_arousals)
-
-    # === 4. Build DataLoaders ===
-    valence_loaders = {
-        "train": DataLoader(valence_train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
-        "val": DataLoader(valence_val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
-        "test": DataLoader(valence_test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    # === 5. Build dataloaders ===
+    loaders = {
+        "train": DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
+        "val": DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
+        "test": DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     }
 
-    arousal_loaders = {
-        "train": DataLoader(arousal_train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn),
-        "val": DataLoader(arousal_val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn),
-        "test": DataLoader(arousal_test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-    }
-
-    print("\n Data splitting complete")
-    print("Loaders are:")
-    print("  - valence_loaders['train'], valence_loaders['val'], valence_loaders['test']")
-    print("  - arousal_loaders['train'], arousal_loaders['val'], arousal_loaders['test']")
-
-    return {
-        "valence": valence_loaders,
-        "arousal": arousal_loaders
-    }
+    print(f"✅ {target_name.capitalize()} dataloaders ready!\n")
+    return loaders
