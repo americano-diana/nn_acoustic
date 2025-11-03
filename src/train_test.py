@@ -1,6 +1,8 @@
 import tqdm
 import torch
 import numpy as np
+import math
+import optuna
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from scipy import stats
 import matplotlib.pyplot as plt
@@ -28,45 +30,135 @@ def train_with_validation(
     val_dataloader,
     feature_extractor,
     optimizer,
+    scheduler,
     criterion,
     device,
     num_epochs,
     sampling_rate,
+    trial=None,
+    grad_clip=1.5,
+    target_stats=None,
+    normalize_targets=False,
+    patience=5,         # early stopping patience
+    min_delta=1e-3,     # min improvement to be considered for early stopping
+    variance_reg_coeff=0.05,  # weight for variance regularization
+    freeze_backbone_epochs=3,
     verbose=True
 ):
     """
-    Training function that also evaluates on validation set each epoch
-    Uses feature_extractor instead of processor for XLSR-53 base model
+    Training function with mode collapse fixes
     """
     model.to(device)
-
     train_losses = []
     val_losses = []
 
+    # Var initialization for early stopping based off val loss
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+
+    # Var initialization for early stopping based off r2
+    best_val_r2 = -float("inf")
+    epochs_no_improve_r2 = 0
+
+
     for epoch in range(num_epochs):
+       # Optional freezing backbone
+        if freeze_backbone_epochs > 0 and epoch < freeze_backbone_epochs:
+            for param in model.wav2vec2.parameters():
+                param.requires_grad = False
+        else:
+            for param in model.wav2vec2.parameters():
+                param.requires_grad = True
+
         # Training phase
         model.train()
         running_train_loss = 0.0
+        running_output_sum = 0.0
+        running_output_sq_sum = 0.0
+        running_target_sum = 0.0
+        running_target_sq_sum = 0.0
+        total_samples = 0
 
-        train_loop = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]", leave=False)
+        epoch_outputs = []
+        epoch_targets = []
+
+    # Add progress bar for training
+        train_loop = tqdm(train_dataloader, desc=f"🟦 Training Epoch {epoch+1}/{num_epochs}", leave=False)
 
         for waveforms, targets in train_loop:
             waveforms = waveforms.to(device)
             targets = targets.to(device)
 
+            # Normalize targets if specified
+            if normalize_targets and target_stats is not None:
+                targets = (targets - target_stats['mean']) / target_stats['std']
+
             input_values, attention_mask = preprocess_batch(waveforms, sampling_rate)
-            input_values = input_values.to(device)
-            attention_mask = attention_mask.to(device)
+            input_values,  attention_mask = input_values.to(device), attention_mask.to(device)
 
             outputs = model(input_values, attention_mask=attention_mask)
             loss = criterion(outputs, targets)
 
+            # Variance regularization
+            pred_std = torch.std(outputs)
+            target_std_batch = torch.std(targets)
+            var_loss = torch.relu(0.3 * target_std_batch - pred_std) # Preds should cover a percentage of variance, atm = 30%
+
+            # combine with main loss
+            loss = loss + variance_reg_coeff * var_loss
+
+            # Backward pass
             optimizer.zero_grad()
             loss.backward()
+
+            # GRADIENT CLIPPING - helps with mode collapse
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
             running_train_loss += loss.item()
+
+            # Memory-efficient output diversity tracking
+            batch_size = outputs.size(0)
+            running_output_sum += outputs.sum().item()
+            running_output_sq_sum += (outputs ** 2).sum().item()
+            total_samples += batch_size
+
+             # Update progress bar with current loss
             train_loop.set_postfix(loss=loss.item())
+
+        # Calculate output statistics for mode collapse detection
+        if total_samples > 0:
+            output_mean = running_output_sum / total_samples
+            output_var = (running_output_sq_sum / total_samples) - (output_mean ** 2)
+            output_std = math.sqrt(max(output_var, 0))
+
+          # Calculate target std for comparison
+            all_targets = []
+            for _, batch_targets in train_dataloader:
+                if target_stats is not None:
+                    batch_targets = (batch_targets - target_stats['mean']) / target_stats['std']
+                all_targets.append(batch_targets)
+            target_std = torch.cat(all_targets).std().item()
+
+            if verbose and epoch % 2 == 0:
+                print(f"Epoch {epoch+1}: Output std={output_std:.4f}, Target std={target_std:.4f}")
+
+            # Improved mode collapse threshold - relative to target std
+            mode_collapse_threshold = max(0.01, target_std * 0.05)  # 5% of target std
+            if output_std < mode_collapse_threshold and epoch > 2:
+                if verbose:
+                    print(f"Mode collapse detected: (output_std={output_std:.4f}). Pruning trial.")
+                if trial is not None:
+                    trial.report(float("inf"), epoch)  # Report collapse to Optuna
+                    raise optuna.exceptions.TrialPruned()  # Prune immediately
+                else:
+                  # Pad the remaining epochs
+                  remaining_epochs = num_epochs - len(train_losses) - 1  # -1 because we haven't added current epoch yet
+                  train_losses.append(float('inf'))
+                  val_losses.append(float('inf'))
+                  train_losses.extend([float('inf')] * remaining_epochs)
+                  val_losses.extend([float('inf')] * remaining_epochs)
+                  return train_losses, val_losses
 
         avg_train_loss = running_train_loss / len(train_dataloader)
         train_losses.append(avg_train_loss)
@@ -74,13 +166,17 @@ def train_with_validation(
         # Validation phase
         model.eval()
         running_val_loss = 0.0
-
-        val_loop = tqdm(val_dataloader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]", leave=False)
+        all_val_outputs = []
+        all_val_targets = []
 
         with torch.no_grad():
-            for waveforms, targets in val_loop:
+            for waveforms, targets in val_dataloader:
                 waveforms = waveforms.to(device)
                 targets = targets.to(device)
+
+                # Normalize targets if specified
+                if normalize_targets and target_stats is not None:
+                    targets = (targets - target_stats['mean']) / target_stats['std']
 
                 input_values, attention_mask = preprocess_batch(waveforms, sampling_rate)
                 input_values = input_values.to(device)
@@ -88,15 +184,70 @@ def train_with_validation(
 
                 outputs = model(input_values, attention_mask=attention_mask)
                 loss = criterion(outputs, targets)
-
                 running_val_loss += loss.item()
-                val_loop.set_postfix(loss=loss.item())
+
+                # store for collapse monitoring
+                all_val_outputs.append(outputs)
+                all_val_targets.append(targets)
 
         avg_val_loss = running_val_loss / len(val_dataloader)
         val_losses.append(avg_val_loss)
 
+        # Update scheduler
+        if scheduler is not None:
+            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                scheduler.step(avg_val_loss)
+            else:
+                scheduler.step()
+
+        # Monitoring model collapse
+        all_val_outputs = torch.cat(all_val_outputs)
+        all_val_targets = torch.cat(all_val_targets)
+
+        pred_std = torch.std(all_val_outputs).item()
+        target_std = torch.std(all_val_targets).item()
+        range_ratio = (all_val_outputs.max() - all_val_outputs.min()) / (all_val_targets.max() - all_val_targets.min() + 1e-8)
+
+        # Compute R²
+        val_preds_np = all_val_outputs.cpu().numpy()
+        val_targets_np = all_val_targets.cpu().numpy()
+        val_r2 = r2_score(val_targets_np, val_preds_np)
+
+        # Logging learning rate and model collapse
         if verbose:
-            print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch+1}/{num_epochs} - Train: {avg_train_loss:.4f}, Val: {avg_val_loss:.4f}, LR: {current_lr:.2e}")
+            print(f"Validation Metrics - pred_std: {pred_std:.4f}, target_std: {target_std:.4f}, range_ratio: {range_ratio:.4f}")
+            print(f"Validation R²: {val_r2:.4f}")
+
+        # Optuna pruning
+        if trial is not None:
+            trial.report(avg_val_loss, epoch)
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+
+        # Early stopping measure based off validation loss
+        if avg_val_loss < best_val_loss - min_delta:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                if verbose:
+                    print(f"Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+                break
+
+        # Early stopping based off R2
+        if val_r2 > best_val_r2 + min_delta:
+            best_val_r2 = val_r2
+            epochs_no_improve_r2 = 0
+            # optionally save best model here
+        else:
+            epochs_no_improve_r2 += 1
+            if epochs_no_improve_r2 >= patience:
+                if verbose:
+                    print(f"Early stopping on R² at epoch {epoch+1} (no improvement for {patience} epochs)")
+                break
 
     return train_losses, val_losses
 

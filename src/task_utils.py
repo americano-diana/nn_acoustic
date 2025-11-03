@@ -118,5 +118,5 @@ def split_data(
         "test": DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
     }
 
-    print(f"✅ {target_name.capitalize()} dataloaders ready!\n")
+    print(f"{target_name.capitalize()} dataloaders ready\n")
     return loaders
