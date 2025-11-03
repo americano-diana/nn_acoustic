@@ -249,7 +249,7 @@ def train_with_validation(
                     print(f"Early stopping on R² at epoch {epoch+1} (no improvement for {patience} epochs)")
                 break
 
-    return train_losses, val_losses
+    return train_losses, val_losses, best_val_r2
 
 def test_model(
     model,

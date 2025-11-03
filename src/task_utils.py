@@ -3,7 +3,58 @@ from torch.utils.data import DataLoader
 from torch.nn.utils.rnn import pad_sequence
 from sklearn.model_selection import train_test_split
    
+class SingleRegression(torch.utils.data.Dataset):
+    """
+    Creates a dataset class called "SingleLabelRegression" that takes in the waveforms and one chosen target (either valence or arousal)
+    """
+    def __init__(self, waveforms, targets):
+        self.waveforms = waveforms
+        self.targets = targets  # Single label (valence or arousal)
 
+    def __len__(self):
+        return len(self.waveforms)
+
+    def __getitem__(self, idx):
+        return self.waveforms[idx], torch.tensor(self.targets[idx], dtype=torch.float32)
+
+
+class FlexibleRegression(torch.utils.data.Dataset):
+    """
+    A toggleable dataset for both single-label and double-label regression.
+
+    If targets are 1D -> Single label (e.g., valence)
+    If targets are 2D -> Double label (e.g., [valence, arousal])
+    Or you can explicitly set num_outputs for clarity.
+    """
+    def __init__(self, waveforms, targets, num_outputs=None):
+        """
+        Args:
+            waveforms: list/tensor of shape (N, ...)
+            targets: list/array/tensor of shape (N,) or (N, 2)
+            num_outputs: optional int (1 or 2). If None, it will auto-detect.
+        """
+        self.waveforms = waveforms
+        self.targets = targets
+
+        # Auto-detect output dimensionality if not provided
+        if num_outputs is None:
+            # handle both list-of-lists and tensors
+            first_target = targets[0]
+            self.num_outputs = len(first_target) if hasattr(first_target, "__len__") and not isinstance(first_target, (str, bytes)) else 1
+        else:
+            self.num_outputs = num_outputs
+
+    def __len__(self):
+        return len(self.waveforms)
+
+    def __getitem__(self, idx):
+        waveform = self.waveforms[idx]
+        target = torch.tensor(self.targets[idx], dtype=torch.float32)
+        # Ensure correct shape: scalar for single output, vector for double
+        if self.num_outputs == 1:
+            target = target.squeeze()  # shape ()
+        return waveform, target
+    
 def collate_fn(batch):
     """
     Collate function for regression (single or double output).
@@ -30,7 +81,6 @@ def collate_fn(batch):
         labels_tensor = torch.tensor(labels, dtype=torch.float32)  # [B]
 
     return waveforms_padded, labels_tensor
-
 
 def split_data(
     waveforms,

@@ -1,9 +1,7 @@
 import torch
 import torch.nn as nn
-
-# File includes a mix of possible flexible regressor heads that can be used for optimization
-
-class OptimizedWav2Vec2Regression(nn.Module):
+    
+class OptimizedRegression(nn.Module):
     def __init__(self, base_model, hidden_size, dropout_rate, num_layers=2, num_outputs=1):
         """
         num_outputs: number of regression outputs (1 for single label, 2 for valence+arousal)
@@ -34,8 +32,7 @@ class OptimizedWav2Vec2Regression(nn.Module):
         out = self.regressor(pooled)
         return out.squeeze(1) if self.num_outputs == 1 else out
     
-
-class ComplexWav2Vec2Regression(nn.Module):
+class ComplexRegression(nn.Module):
     def __init__(self, base_model, hidden_size, dropout_rate, num_layers=3,
                  activation='gelu', use_batch_norm=True, pooling_method='mean',
                  use_residual=True, num_outputs=1):
