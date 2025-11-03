@@ -44,7 +44,7 @@ def create_optimized_model(base_model, config):
         raise ValueError(f"Unknown model_type: {model_type}")
 
 
-def objective(trial, waveforms, targets, target_name):
+def objective(trial, waveforms, targets, target_name, model_name, model_sr, feature_extractor, device):
     print(f"\n Starting trial {trial.number} for {target_name}")
     print(f"Trial {trial.number} params: {trial.params}")
 
@@ -177,7 +177,7 @@ def objective(trial, waveforms, targets, target_name):
         torch.cuda.empty_cache()
 
 
-def setup_and_run_optimization(target_type, waveforms, targets, n_trials, timeout=3600):
+def setup_and_run_optimization(target_type, waveforms, targets, n_trials, timeout, model_name, model_sr, feature_extractor, device):
     import pickle
 
     print("Starting Optuna Optimization")
@@ -195,7 +195,11 @@ def setup_and_run_optimization(target_type, waveforms, targets, n_trials, timeou
         trial,
         waveforms=waveforms,
         targets=targets,
-        target_name=target_type
+        target_name=target_type,
+        model_name=model_name,
+        model_sr=model_sr,
+        feature_extractor=feature_extractor,
+        device=device,
     )
 
     # Run optimization
