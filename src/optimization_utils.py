@@ -1,136 +1,68 @@
 """"
 Helper functions to utilize optuna for hyperparameter optimization
 """
-# Regressor head with flexible architecture for optimization
+import torch
+import torch.nn as nn
+import optuna
 
-class OptimizedWav2Vec2Regression(nn.Module):
-    def __init__(self, base_model, hidden_size, dropout_rate, num_layers=2):
-        super().__init__()
-        self.wav2vec2 = base_model
+from src.task_utils import collate_fn, split_data
+from src.model_architecture import SingleRegression, FlexibleRegression
+from transformers import Wav2Vec2Model
+from src.train_test import train_with_validation
 
-        # Build dynamic regressor based on trial parameters
-        layers = []
-        input_size = self.wav2vec2.config.hidden_size
-
-        for i in range(num_layers - 1):
-            layers.extend([
-                nn.Linear(input_size, hidden_size),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate)
-            ])
-            input_size = hidden_size
-
-        # Final output layer
-        layers.append(nn.Linear(input_size, 1))
-
-        self.regressor = nn.Sequential(*layers)
-
-    def forward(self, input_values, attention_mask=None):
-        outputs = self.wav2vec2(input_values, attention_mask=attention_mask)
-        pooled = outputs.last_hidden_state.mean(dim=1)
-        return self.regressor(pooled).squeeze(1)
-    
-class ComplexWav2Vec2Regression(nn.Module):
-    def __init__(self, base_model, hidden_size, dropout_rate, num_layers=3, activation='gelu', use_batch_norm=True, pooling_method='mean', use_residual=True):
-        super().__init__()
-        self.wav2vec2 = base_model
-        self.pooling_method = pooling_method
-        self.use_residual = use_residual
-
-        # Activation selection
-        activations = {
-            'relu': nn.ReLU(),
-            'gelu': nn.GELU(),
-            'leaky_relu': nn.LeakyReLU(0.1),
-            'swish': nn.SiLU()
-        }
-        act_fn = activations.get(activation, nn.ReLU())
-
-        # Build regression layers
-        layers = []
-        input_size = self.wav2vec2.config.hidden_size
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(input_size, hidden_size))
-            if use_batch_norm:
-                layers.append(nn.BatchNorm1d(hidden_size))
-            layers.append(act_fn)
-            layers.append(nn.Dropout(dropout_rate))
-            input_size = hidden_size
-
-        self.regressor = nn.Sequential(*layers)
-        self.output_layer = nn.Linear(input_size, 1)
-
-        if use_residual:
-            self.residual_projection = nn.Linear(self.wav2vec2.config.hidden_size, 1)
-
-    def forward(self, input_values, attention_mask=None):
-        outputs = self.wav2vec2(input_values, attention_mask=attention_mask)
-        pooled = outputs.last_hidden_state.mean(dim=1) if self.pooling_method == 'mean' else outputs.last_hidden_state[:, 0, :]
-        x = self.regressor(pooled)
-        out = self.output_layer(x).squeeze(1)
-        if self.use_residual:
-            out += self.residual_projection(pooled).squeeze(1)
-        return out
-    
 def create_optimized_model(base_model, config):
     """
-    Factory function to create different Wav2Vec2 regression model variants.
-
-    Args:
-        base_model: Pretrained Wav2Vec2 model.
-        config: Dictionary with keys:
-            - model_type: 'simple', 'improved', or 'complex'
-            - hidden_size: int
-            - dropout_rate: float
-            - num_layers: int
-            - activation: str, optional (for 'complex')
-            - use_batch_norm: bool, optional
-            - pooling_method: str, optional ('mean' or 'first'), optional for 'complex'
-            - use_residual: bool, optional (for improved versions)
+    Factory function to create different regression model variants.
+    Works with SingleRegression, FlexibleRegression, and ComplexRegression.
     """
-    model_type = config.get('model_type', 'simple')
+    model_type = config.get("model_type", "flexible")
+    num_outputs = config.get("num_outputs", 1)  # 🔸 toggleable output count
 
-    if model_type == 'simple':
-        return OptimizedWav2Vec2Regression(
+    if model_type == "single":
+        return SingleRegression(
             base_model=base_model,
-            hidden_size=config['hidden_size'],
-            dropout_rate=config['dropout_rate'],
-            num_layers=config.get('num_layers', 2)
+            hidden_size=config["hidden_size"],
+            dropout_rate=config["dropout_rate"],
+            num_layers=config.get("num_layers", 2),
+            num_outputs=num_outputs  # allow flexibility
         )
-    elif model_type == 'improved':
-        return ImprovedWav2Vec2Regression(
+
+    elif model_type == "flexible":
+        return FlexibleRegression(
             base_model=base_model,
-            hidden_size=config['hidden_size'],
-            dropout_rate=config['dropout_rate'],
-            num_layers=config.get('num_layers', 2),
-            use_batch_norm=config.get('use_batch_norm', True)
+            hidden_size=config["hidden_size"],
+            dropout_rate=config["dropout_rate"],
+            num_layers=config.get("num_layers", 2),
+            use_batch_norm=config.get("use_batch_norm", True),
+            num_outputs=num_outputs
         )
-    elif model_type == 'complex':
-        return ComplexWav2Vec2Regression(
+
+    elif model_type == "complex":
+        return ComplexRegression(
             base_model=base_model,
-            hidden_size=config['hidden_size'],
-            dropout_rate=config['dropout_rate'],
-            num_layers=config.get('num_layers', 3),
-            activation=config.get('activation', 'gelu'),
-            use_batch_norm=config.get('use_batch_norm', True),
-            pooling_method=config.get('pooling_method', 'mean'),
-            use_residual=config.get('use_residual', True)
+            hidden_size=config["hidden_size"],
+            dropout_rate=config["dropout_rate"],
+            num_layers=config.get("num_layers", 3),
+            activation=config.get("activation", "gelu"),
+            use_batch_norm=config.get("use_batch_norm", True),
+            pooling_method=config.get("pooling_method", "mean"),
+            use_residual=config.get("use_residual", True),
+            num_outputs=num_outputs
         )
+
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
 
-def objective_valence(trial, train_dataset, val_dataset, test_dataset, target_name):
-    """
-    Optuna objective function optimized for R², with adaptive variance regularization
-    and extended hyperparameter search.
-    """
-    print(f"\n🚀 Starting trial {trial.number} for {target_name}")
+def objective(trial, train_dataset, val_dataset, test_dataset, target_name):
+    print(f"\nStarting trial {trial.number} for {target_name}")
 
     # -------------------------
-    # 🔧 Hyperparameter search space
+    # Hyperparameter search space
     # -------------------------
-    model_type = trial.suggest_categorical("model_type", ["simple", "improved"])
+    model_type = trial.suggest_categorical("model_type", ["single", "flexible", "complex"])
+    num_outputs = trial.suggest_int("num_outputs", 1, 2)  # allows single vs double regression
+
     learning_rate = trial.suggest_float("learning_rate", 1.5e-5, 3.5e-5, log=True)
     batch_size = trial.suggest_categorical("batch_size", [8, 16])
     hidden_size = trial.suggest_categorical("hidden_size", [256, 512, 768])
@@ -149,12 +81,12 @@ def objective_valence(trial, train_dataset, val_dataset, test_dataset, target_na
     freeze_backbone_epochs = trial.suggest_int("freeze_backbone_epochs", 1, 4)
     min_delta = trial.suggest_float("min_delta", 1e-4, 1e-2, log=True)
     use_batch_norm = trial.suggest_categorical("use_batch_norm", [True, False])
-    pooling_method = trial.suggest_categorical("pooling_method", ["mean", "max", "attention"])
+    pooling_method = trial.suggest_categorical("pooling_method", ["mean", "first"])
     use_residual = trial.suggest_categorical("use_residual", [True, False])
     activation = trial.suggest_categorical("activation", ["relu", "gelu"])
 
     # -------------------------
-    # 📦 Dataloaders
+    # Dataloaders
     # -------------------------
     train_loader, val_loader, _ = create_dataloaders_with_batch_size(
         train_dataset, val_dataset, test_dataset, batch_size, collate_fn
@@ -162,7 +94,7 @@ def objective_valence(trial, train_dataset, val_dataset, test_dataset, target_na
 
     try:
         # -------------------------
-        # 🧠 Model creation
+        # Model creation
         # -------------------------
         base_model = Wav2Vec2Model.from_pretrained(model_name)
 
@@ -175,17 +107,19 @@ def objective_valence(trial, train_dataset, val_dataset, test_dataset, target_na
             "pooling_method": pooling_method,
             "use_residual": use_residual,
             "activation": activation,
+            "num_outputs": num_outputs,  # 🔸 toggleable output count
         }
 
         model = create_optimized_model(base_model, model_config).to(device)
 
         # -------------------------
-        # ⚙️ Optimizer and Scheduler
+        # Optimizer, Scheduler, Loss
         # -------------------------
-        if optimizer_name == "Adam":
-            optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        else:
-            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        optimizer = (
+            torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+            if optimizer_name == "Adam"
+            else torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        )
 
         if scheduler_type == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
@@ -196,31 +130,10 @@ def objective_valence(trial, train_dataset, val_dataset, test_dataset, target_na
         else:
             scheduler = None
 
-        # -------------------------
-        # 🎯 Criterion
-        # -------------------------
-        if criterion_name == "MSELoss":
-            criterion = nn.MSELoss()
-        elif criterion_name == "SmoothL1Loss":
-            criterion = nn.SmoothL1Loss(beta=0.5)
-        else:
-            criterion = nn.L1Loss()
+        criterion = nn.MSELoss() if criterion_name == "MSELoss" else nn.SmoothL1Loss(beta=0.5)
 
         # -------------------------
-        # 📏 Target normalization
-        # -------------------------
-        target_stats = None
-        if normalize_targets:
-            all_targets = []
-            for _, targets in train_loader:
-                all_targets.append(targets.numpy())
-            all_targets = np.concatenate(all_targets)
-            std = np.std(all_targets)
-            std = std if std > 1e-6 else 1.0
-            target_stats = {'mean': np.mean(all_targets), 'std': std}
-
-        # -------------------------
-        # 🚀 Train model
+        # Train
         # -------------------------
         train_losses, val_losses, best_val_r2 = train_with_validation(
             model=model,
@@ -235,7 +148,6 @@ def objective_valence(trial, train_dataset, val_dataset, test_dataset, target_na
             sampling_rate=model_sr,
             trial=trial,
             grad_clip=grad_clip,
-            target_stats=target_stats,
             normalize_targets=normalize_targets,
             patience=patience,
             min_delta=min_delta,
@@ -243,28 +155,19 @@ def objective_valence(trial, train_dataset, val_dataset, test_dataset, target_na
             var_reg_target_ratio=var_reg_target_ratio,
             freeze_backbone_epochs=freeze_backbone_epochs,
             prioritize_r2=prioritize_r2,
-            verbose=True
+            verbose=True,
         )
 
         # -------------------------
-        # 🏆 Evaluation Metric
+        # Objective
         # -------------------------
-        if prioritize_r2:
-            objective_value = -best_val_r2  # maximize R² by minimizing its negative
-            print(f"✅ Trial {trial.number} completed - Best Val R²: {best_val_r2:.4f}")
-        else:
-            best_val_loss = min(val_losses)
-            objective_value = best_val_loss
-            print(f"✅ Trial {trial.number} completed - Best Val Loss: {best_val_loss:.4f}")
-
-        return objective_value
+        return -best_val_r2 if prioritize_r2 else min(val_losses)
 
     except Exception as e:
-        print(f"❌ Trial {trial.number} failed with error: {e}")
-        return float('inf')
+        print(f"Trial {trial.number} failed: {e}")
+        return float("inf")
 
     finally:
-        del model, optimizer, scheduler
         torch.cuda.empty_cache()
 
 
@@ -294,12 +197,7 @@ def setup_and_run_optimization(target_type, train_dataset, val_dataset, test_dat
     print("="*60)
 
     # Pick objective function
-    if target_type.lower() == "valence":
-        objective_func = objective_valence
-    elif target_type.lower() == "arousal":
-      objective_func = objective_arousal
-    else:
-      raise ValueError(f"Unknown target type: {target_type}")
+    objective_func = objective
 
     # Running optimization
     print(f"OPTIMIZING {target_type.upper()} MODEL")
@@ -436,3 +334,144 @@ def setup_and_run_optimization(target_type, train_dataset, val_dataset, test_dat
     print(f"\n✅ Final model saved at {save_path}")
 
     return study, save_path
+
+
+import torch
+import torch.nn as nn
+import optuna
+from torch.utils.data import DataLoader
+
+# ✅ assume these are defined somewhere:
+# - collate_fn (toggleable version)
+# - split_data()
+# - SingleLabelRegression, FlexibleRegression
+# - Wav2Vec2Model, feature_extractor, train_with_validation, device, model_sr
+
+def objective(trial, waveforms, targets, target_name):
+    print(f"\n🚀 Starting trial {trial.number} for {target_name}")
+
+    # -------------------------
+    # Hyperparameter search space
+    # -------------------------
+    model_type = trial.suggest_categorical("model_type", ["single", "flexible", "complex"])
+    num_outputs = trial.suggest_int("num_outputs", 1, 2)  # allows single vs double regression
+
+    learning_rate = trial.suggest_float("learning_rate", 1.5e-5, 3.5e-5, log=True)
+    batch_size = trial.suggest_categorical("batch_size", [8, 16])
+    hidden_size = trial.suggest_categorical("hidden_size", [256, 512, 768])
+    dropout_rate = trial.suggest_float("dropout_rate", 0.15, 0.35)
+    num_layers = trial.suggest_int("num_layers", 2, 4)
+    weight_decay = trial.suggest_float("weight_decay", 1e-5, 3e-4, log=True)
+    optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "AdamW"])
+    scheduler_type = trial.suggest_categorical("scheduler", ["step", "cosine", "exponential"])
+    criterion_name = trial.suggest_categorical("criterion", ["MSELoss", "SmoothL1Loss"])
+    normalize_targets = trial.suggest_categorical("normalize_targets", [False, True])
+    grad_clip = trial.suggest_float("grad_clip", 1.0, 2.0)
+    variance_reg_coeff = trial.suggest_float("variance_reg_coeff", 0.05, 0.15)
+    var_reg_target_ratio = trial.suggest_float("var_reg_target_ratio", 0.4, 0.7)
+    patience = trial.suggest_int("patience", 3, 8)
+    prioritize_r2 = trial.suggest_categorical("prioritize_r2", [True, False])
+    freeze_backbone_epochs = trial.suggest_int("freeze_backbone_epochs", 1, 4)
+    min_delta = trial.suggest_float("min_delta", 1e-4, 1e-2, log=True)
+    use_batch_norm = trial.suggest_categorical("use_batch_norm", [True, False])
+    pooling_method = trial.suggest_categorical("pooling_method", ["mean", "first"])
+    use_residual = trial.suggest_categorical("use_residual", [True, False])
+    activation = trial.suggest_categorical("activation", ["relu", "gelu"])
+
+    # -------------------------
+    # Pick dataset class dynamically
+    # -------------------------
+    dataset_class = SingleLabelRegression if num_outputs == 1 else FlexibleRegression
+
+    # -------------------------
+    # Create data loaders using split_data()
+    # -------------------------
+    loaders = split_data(
+        waveforms=waveforms,
+        targets=targets,
+        target_name=target_name,
+        batch_size=batch_size,
+        collate_fn=collate_fn,
+        dataset_class=dataset_class
+    )
+
+    train_loader = loaders["train"]
+    val_loader = loaders["val"]
+
+    try:
+        # -------------------------
+        # Model creation
+        # -------------------------
+        base_model = Wav2Vec2Model.from_pretrained(model_name)
+
+        model_config = {
+            "model_type": model_type,
+            "hidden_size": hidden_size,
+            "dropout_rate": dropout_rate,
+            "num_layers": num_layers,
+            "use_batch_norm": use_batch_norm,
+            "pooling_method": pooling_method,
+            "use_residual": use_residual,
+            "activation": activation,
+            "num_outputs": num_outputs,  # 🔸 toggleable output count
+        }
+
+        model = create_optimized_model(base_model, model_config).to(device)
+
+        # -------------------------
+        # Optimizer, Scheduler, Loss
+        # -------------------------
+        optimizer = (
+            torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+            if optimizer_name == "Adam"
+            else torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        )
+
+        if scheduler_type == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+        elif scheduler_type == "step":
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.7)
+        elif scheduler_type == "exponential":
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+        else:
+            scheduler = None
+
+        criterion = nn.MSELoss() if criterion_name == "MSELoss" else nn.SmoothL1Loss(beta=0.5)
+
+        # -------------------------
+        # Train
+        # -------------------------
+        train_losses, val_losses, best_val_r2 = train_with_validation(
+            model=model,
+            train_dataloader=train_loader,
+            val_dataloader=val_loader,
+            feature_extractor=feature_extractor,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            criterion=criterion,
+            device=device,
+            num_epochs=30,
+            sampling_rate=model_sr,
+            trial=trial,
+            grad_clip=grad_clip,
+            normalize_targets=normalize_targets,
+            patience=patience,
+            min_delta=min_delta,
+            variance_reg_coeff=variance_reg_coeff,
+            var_reg_target_ratio=var_reg_target_ratio,
+            freeze_backbone_epochs=freeze_backbone_epochs,
+            prioritize_r2=prioritize_r2,
+            verbose=True,
+        )
+
+        # -------------------------
+        # Objective
+        # -------------------------
+        return -best_val_r2 if prioritize_r2 else min(val_losses)
+
+    except Exception as e:
+        print(f"Trial {trial.number} failed: {e}")
+        return float("inf")
+
+    finally:
+        torch.cuda.empty_cache()
